@@ -1,0 +1,1 @@
+from database import Base # Sin el punto
