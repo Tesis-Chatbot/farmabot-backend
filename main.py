@@ -1,15 +1,36 @@
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Body
-from database import supabase
 from fastapi.middleware.cors import CORSMiddleware
+from database import supabase
 
-app = FastAPI(title="Chatbot Farmacia")
+load_dotenv()
 
-# Configuración de CORS
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
+# 1. Definir los metadatos de las etiquetas
+tags_metadata = [
+    {
+        "name": "Catalogo de Productos",
+        "description": "Endpoints para consultar medicinas, stock y promociones vigentes.",
+    },
+    {
+        "name": "Punto de Venta",
+        "description": "Operaciones relacionadas con el procesamiento de tickets y actualización de inventario.",
+    },
+    {
+        "name": "Sistema",
+        "description": "Validación de estado del servidor.",
+    },
 ]
+
+# 2. Crear la instancia de FastAPI
+app = FastAPI(
+    title="Chatbot Farmacia",
+    openapi_tags=tags_metadata
+)
+
+# 3. Configuración de CORS
+origins_str = os.getenv("CORS_ORIGINS", "")
+origins = origins_str.split(",") if origins_str else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,11 +40,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Conexión exitosa"}
+# --- Endpoints ---
 
-@app.get("/medicamentos")
+@app.get("/", tags=["Sistema"])
+def read_root():
+    return {"message": "Conexión exitosa, bienvenido a FarmaBot"}
+
+@app.get("/medicamentos", tags=["Catalogo de Productos"])
 def get_medicamentos():
     # Consultamos medicamentos con su stock y sus promociones activas
     # Traemos: datos de medicina, stock, y de la tabla promotion traemos amount y la descripción del tipo
@@ -44,7 +67,6 @@ def get_medicamentos():
     
     for item in data:
         # 1. Cálculo de Stock (como ya lo tenías)
-        # print(f"Datos crudos del producto {item.get('name')}: {item.keys()}")
         stock_entries = item.get('medicaments_stock') or []
         total_stock = sum(s.get('stock', 0) for s in stock_entries)
         
@@ -78,7 +100,7 @@ def get_medicamentos():
         
     return productos_finales
 
-@app.post("/ventas")
+@app.post("/ventas", tags=["Punto de Venta"])
 async def procesar_venta(payload: dict = Body(...)):
     try:
         items = payload.get("items", [])
