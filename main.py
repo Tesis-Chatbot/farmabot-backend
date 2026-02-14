@@ -17,8 +17,8 @@ tags_metadata = [
         "description": "Operaciones relacionadas con el procesamiento de tickets y actualización de inventario.",
     },
     {
-        "name": "Sistema",
-        "description": "Validación de estado del servidor.",
+        "name": "Tarjetas de Lealtad",
+        "description": "Consulta de historial de clientes y beneficios por puntos.",
     },
 ]
 
@@ -46,6 +46,7 @@ app.add_middleware(
 def read_root():
     return {"message": "Conexión exitosa, bienvenido a FarmaBot"}
 
+## CATALOGO DE PRODUCTOS
 @app.get("/medicamentos", tags=["Catalogo de Productos"])
 def get_medicamentos():
     # Consultamos medicamentos con su stock y sus promociones activas
@@ -100,6 +101,9 @@ def get_medicamentos():
         
     return productos_finales
 
+
+
+## PUNTO DE VENTA
 @app.post("/ventas", tags=["Punto de Venta"])
 async def procesar_venta(payload: dict = Body(...)):
     try:
@@ -162,3 +166,40 @@ async def procesar_venta(payload: dict = Body(...)):
         print(f"Error detallado: {str(e)}")
         # Devolvemos el error para que lo veas en el alert de React
         raise HTTPException(status_code=500, detail=str(e))
+    
+    
+## TARJETAS DE LEALTAD
+@app.get("/clientes/{num_tarjeta}", tags=["Tarjetas de Lealtad"])
+async def get_cliente_by_card(num_tarjeta: int):
+    try:
+        # Usamos el operador "!" para decirle exactamente qué relación seguir
+        query = """
+            *,
+            tickets!tickets_card_id_fkey (
+                id,
+                folio,
+                total,
+                created_at,
+                payment_method,
+                ticket_details (
+                    id,
+                    barcode,
+                    quantity,
+                    price_at_sale
+                )
+            )
+        """
+        
+        response = supabase.table("loyalty_cards") \
+            .select(query) \
+            .eq("card", num_tarjeta) \
+            .execute()
+
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Tarjeta no encontrada")
+
+        return response.data[0]
+
+    except Exception as e:
+        print(f"DEBUG ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error de ambigüedad en la base de datos.")
