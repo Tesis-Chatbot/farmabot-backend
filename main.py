@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from database import supabase
+import datetime
 
 load_dotenv()
 
@@ -108,65 +109,82 @@ def get_medicamentos():
 async def procesar_venta(payload: dict = Body(...)):
     try:
         items = payload.get("items", [])
+        # Obtenemos la sucursal del payload (por defecto 1 si no viene)
+        store_id = int(payload.get("store_id", 1)) 
+        
         if not items:
             raise HTTPException(status_code=400, detail="Carrito vacío")
 
-        # 1. Buscar tarjeta de lealtad para obtener el ID numérico
+        # 1. Buscar tarjeta de lealtad
         card_id = None
-        if payload.get("card_number"):
-            # Buscamos en loyalty_cards usando el número de 14 dígitos
-            card_res = supabase.table("loyalty_cards").select("id").eq("card", payload["card_number"]).execute()
+        card_number = payload.get("card_number")
+        if card_number:
+            card_res = supabase.table("loyalty_cards").select("id").eq("card", card_number).execute()
             if card_res.data:
                 card_id = card_res.data[0]["id"]
 
-        # 2. Insertar Ticket (Cabecera)
-        # Nota: 'folio' e 'id' son automáticos si están configurados como serial/identity
+        # 2. Insertar Ticket (Cabecera inicial)
         ticket_data = {
             "total": float(payload["total"]),
-            "card_id": card_id, # El ID (FK)
-            "card": int(payload["card_number"]) if payload.get("card_number") else None, # El número de 14 dígitos como int
-            "payment_method": "Efectivo" # Esto ya debería entrar como string
+            "card_id": card_id,
+            "card": int(card_number) if card_number else None,
+            "payment_method": payload.get("payment_method", "Efectivo"),
+            "store_id": store_id,
+            "folio": 0
         }
         
         ticket_res = supabase.table("tickets").insert(ticket_data).execute()
-        
         if not ticket_res.data:
-            raise Exception("No se pudo insertar el ticket")
+            raise Exception("Error al crear la cabecera del ticket")
             
         nuevo_ticket_id = ticket_res.data[0]["id"]
 
-        # 3. Detalles y Actualización de Stock
+        # 3. Generar Folio Numérico (BigInt)
+        # Formato: AAAAMMDD + ID_TIENDA (2 dígitos) + ID_TICKET (4 o más dígitos)
+        fecha_str = datetime.datetime.now().strftime("%Y%m%d")
+        # Generamos un número único que quepa en un BigInt
+        folio_numerico = int(f"{fecha_str}{store_id:02d}{nuevo_ticket_id}")
+        
+        # Actualizamos el ticket con su folio real
+        supabase.table("tickets").update({"folio": folio_numerico}).eq("id", nuevo_ticket_id).execute()
+
+        # 4. Detalles y Actualización de Stock
         for item in items:
-            # A. Insertar detalle
+            # A. Detalle del ticket
             detalle = {
                 "ticket_id": nuevo_ticket_id,
-                "barcode": int(item["barcode"]), # Convertimos a int para tu FK
+                "barcode": int(item["barcode"]),
                 "quantity": int(item["quantity"]),
-                "price_at_sale": float(item["price"])
+                "price_at_sale": float(item["price"]),
+                "promotion_id": item.get("promotion_id") if item.get("promotion_id") else None
             }
             supabase.table("ticket_details").insert(detalle).execute()
 
-            # B. Actualizar Stock
-            # Buscamos el stock actual en la sucursal 1 (simulada)
+            # B. Actualizar Stock en la sucursal específica
             stock_res = supabase.table("medicaments_stock") \
                 .select("stock") \
                 .eq("barcode", item["barcode"]) \
-                .eq("store", 1).execute()
+                .eq("store", store_id).execute()
 
             if stock_res.data:
-                nuevo_stock = stock_res.data[0]["stock"] - item["quantity"]
+                actual_stock = stock_res.data[0]["stock"]
+                nuevo_stock = actual_stock - int(item["quantity"])
+                
                 supabase.table("medicaments_stock") \
                     .update({"stock": nuevo_stock}) \
                     .eq("barcode", item["barcode"]) \
-                    .eq("store", 1).execute()
+                    .eq("store", store_id).execute()
 
-        return {"status": "success", "ticket_id": nuevo_ticket_id}
+        return {
+            "status": "success", 
+            "ticket_id": nuevo_ticket_id, 
+            "folio": folio_numerico,
+            "store_id": store_id
+        }
 
     except Exception as e:
-        print(f"Error detallado: {str(e)}")
-        # Devolvemos el error para que lo veas en el alert de React
+        print(f"Error detallado en Venta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    
     
 ## TARJETAS DE LEALTAD
 @app.get("/clientes/{num_tarjeta}", tags=["Tarjetas de Lealtad"])
