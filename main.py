@@ -1,15 +1,36 @@
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Body
-from database import supabase
 from fastapi.middleware.cors import CORSMiddleware
+from database import supabase
 
-app = FastAPI(title="Chatbot Farmacia")
+load_dotenv()
 
-# Configuración de CORS
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
+# 1. Definir los metadatos de las etiquetas
+tags_metadata = [
+    {
+        "name": "Catalogo de Productos",
+        "description": "Endpoints para consultar medicinas, stock y promociones vigentes.",
+    },
+    {
+        "name": "Punto de Venta",
+        "description": "Operaciones relacionadas con el procesamiento de tickets y actualización de inventario.",
+    },
+    {
+        "name": "Sistema",
+        "description": "Validación de estado del servidor.",
+    },
 ]
+
+# 2. Crear la instancia de FastAPI
+app = FastAPI(
+    title="Chatbot Farmacia",
+    openapi_tags=tags_metadata
+)
+
+# 3. Configuración de CORS
+origins_str = os.getenv("CORS_ORIGINS", "")
+origins = origins_str.split(",") if origins_str else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,40 +40,67 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Conexión exitosa"}
+# --- Endpoints ---
 
-@app.get("/medicamentos")
+@app.get("/", tags=["Sistema"])
+def read_root():
+    return {"message": "Conexión exitosa, bienvenido a FarmaBot"}
+
+@app.get("/medicamentos", tags=["Catalogo de Productos"])
 def get_medicamentos():
-    # Consultamos medicamentos y pedimos que traiga la relación con stock
-    response = supabase.table("medicaments").select("*, medicaments_stock(stock)").execute()
+    # Consultamos medicamentos con su stock y sus promociones activas
+    # Traemos: datos de medicina, stock, y de la tabla promotion traemos amount y la descripción del tipo
+    query = """
+        *,
+        medicaments_stock(stock),
+        promotion(
+            id,
+            amount,
+            active,
+            promotion_types(description)
+        )
+    """
+    response = supabase.table("medicaments").select(query).execute()
     
-    productos_con_stock = []
-    
-    # Verificamos que response.data no sea None
+    productos_finales = []
     data = response.data if response.data else []
     
     for item in data:
-        # Manejamos si medicaments_stock es None con 'or []'
+        # 1. Cálculo de Stock (como ya lo tenías)
         stock_entries = item.get('medicaments_stock') or []
-        
-        # Sumamos el stock de todas las sucursales para ese medicamento
         total_stock = sum(s.get('stock', 0) for s in stock_entries)
         
-        # Limpiamos el objeto para el front
+        # 2. Filtrado de Promociones Activas
+        # Supabase trae todas, pero solo queremos enviar las que 'active' sea True
+        all_promotions = item.get('promotion') or []
+        active_promos = []
+        
+        for p in all_promotions:
+            if p.get('active'):
+                # Simplificamos el objeto de promoción para el Front
+                tipo_desc = p.get('promotion_types', {}).get('description', 'General')
+                active_promos.append({
+                    "id": p.get('id'),
+                    "tipo": tipo_desc,
+                    "valor": p.get('amount')
+                })
+
+        # 3. Limpieza del objeto para el Front
         nuevo_item = item.copy()
         nuevo_item['stock'] = total_stock
+        nuevo_item['promociones'] = active_promos # Agregamos la lista limpia
         
-        # Borramos la relación original para enviar un JSON limpio
-        if 'medicaments_stock' in nuevo_item:
-            del nuevo_item['medicaments_stock']
+        # Borramos las relaciones crudas de Supabase para no ensuciar el JSON
+        keys_to_del = ['medicaments_stock', 'promotion']
+        for key in keys_to_del:
+            if key in nuevo_item:
+                del nuevo_item[key]
             
-        productos_con_stock.append(nuevo_item)
+        productos_finales.append(nuevo_item)
         
-    return productos_con_stock
+    return productos_finales
 
-@app.post("/ventas")
+@app.post("/ventas", tags=["Punto de Venta"])
 async def procesar_venta(payload: dict = Body(...)):
     try:
         items = payload.get("items", [])
