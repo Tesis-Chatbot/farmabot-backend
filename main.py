@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from database import supabase
 import datetime
+import re
 
 load_dotenv()
 
@@ -190,20 +191,13 @@ async def procesar_venta(payload: dict = Body(...)):
 @app.get("/clientes/{num_tarjeta}", tags=["Tarjetas de Lealtad"])
 async def get_cliente_by_card(num_tarjeta: int):
     try:
-        # Usamos los nombres exactos de tus columnas: promotion_type y amount
         query = """
             *,
             tickets!tickets_card_id_fkey (
                 id,
-                folio,
-                total,
-                created_at,
-                payment_method,
                 ticket_details (
-                    id,
                     barcode,
                     quantity,
-                    price_at_sale,
                     promotion_id,
                     medicaments (
                         name,
@@ -212,27 +206,76 @@ async def get_cliente_by_card(num_tarjeta: int):
                             barcode,
                             promotion_type,
                             amount,
-                            active,
-                            promotion_types (
-                                description
-                            )
+                            active
                         )
                     )
                 )
             )
         """
         
-        response = supabase.table("loyalty_cards") \
-            .select(query) \
-            .eq("card", num_tarjeta) \
-            .execute()
+        response = supabase.table("loyalty_cards").select(query).eq("card", num_tarjeta).execute()
 
         if not response.data:
             raise HTTPException(status_code=404, detail="Tarjeta no encontrada")
 
-        # Retornamos la data del cliente con su historial y promociones
-        return response.data[0]
+        cliente = response.data[0]
+        tickets = cliente.get("tickets", [])
+        resumen_promociones = {}
+
+        for t in tickets:
+            for detalle in t.get("ticket_details", []):
+                medicamento = detalle.get("medicaments")
+                if not medicamento: continue
+                
+                promos = medicamento.get("promotion", [])
+                promo_activa = next((p for p in promos if p.get("promotion_type") == 2 and p.get("active")), None)
+
+                if promo_activa:
+                    barcode = detalle["barcode"]
+                    raw_amount = str(promo_activa["amount"]) # Trae "3+1"
+                    
+                    # --- Lógica para extraer el número de la meta ---
+                    # Buscamos el primer número antes del '+' o simplemente el número
+                    match = re.search(r'(\d+)', raw_amount)
+                    if match:
+                        meta = int(match.group(1)) # Convierte el "3" de "3+1" a entero
+                    else:
+                        continue # Si no hay números, saltamos esta promo
+                    # -----------------------------------------------
+
+                    cantidad_comprada = detalle["quantity"]
+
+                    if barcode not in resumen_promociones:
+                        resumen_promociones[barcode] = {
+                            "nombre": medicamento["name"],
+                            "acumulado_total": 0,
+                            "meta_para_regalo": meta,
+                            "texto_promo": raw_amount, # Guardamos el "3+1" para el Front
+                            "regalos_ganados": 0,
+                            "unidades_faltantes": 0
+                        }
+                    
+                    resumen_promociones[barcode]["acumulado_total"] += cantidad_comprada
+
+        # Calcular saldos finales
+        for barcode, info in resumen_promociones.items():
+            total = info["acumulado_total"]
+            meta = info["meta_para_regalo"]
+            
+            # Ejemplo: Total 5, Meta 3 (3+1)
+            info["regalos_ganados"] = total // meta # Resultado: 1 regalo
+            resto = total % meta
+            
+            if resto == 0 and total > 0:
+                # Si compró justo 3, 6, 9... le faltan de nuevo 3 para el siguiente ciclo
+                info["unidades_faltantes"] = meta
+            else:
+                info["unidades_faltantes"] = meta - resto
+
+        cliente["resumen_lealtad"] = list(resumen_promociones.values())
+        
+        return cliente
 
     except Exception as e:
         print(f"DEBUG ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error en base de datos: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error procesando la promo 3+1: {str(e)}")
