@@ -190,7 +190,7 @@ async def procesar_venta(payload: dict = Body(...)):
 @app.get("/clientes/{num_tarjeta}", tags=["Tarjetas de Lealtad"])
 async def get_cliente_by_card(num_tarjeta: int):
     try:
-        # Usamos el operador "!" para decirle exactamente qué relación seguir
+        # Usamos los nombres exactos de tus columnas: promotion_type y amount
         query = """
             *,
             tickets!tickets_card_id_fkey (
@@ -203,7 +203,21 @@ async def get_cliente_by_card(num_tarjeta: int):
                     id,
                     barcode,
                     quantity,
-                    price_at_sale
+                    price_at_sale,
+                    promotion_id,
+                    medicaments (
+                        name,
+                        promotion (
+                            id,
+                            barcode,
+                            promotion_type,
+                            amount,
+                            active,
+                            promotion_types (
+                                description
+                            )
+                        )
+                    )
                 )
             )
         """
@@ -216,8 +230,9 @@ async def get_cliente_by_card(num_tarjeta: int):
         if not response.data:
             raise HTTPException(status_code=404, detail="Tarjeta no encontrada")
 
+        # Retornamos la data del cliente con su historial y promociones
         return response.data[0]
 
     except Exception as e:
         print(f"DEBUG ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error de ambigüedad en la base de datos.")
+        raise HTTPException(status_code=500, detail=f"Error en base de datos: {str(e)}")
