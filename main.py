@@ -110,81 +110,106 @@ def get_medicamentos():
 async def procesar_venta(payload: dict = Body(...)):
     try:
         items = payload.get("items", [])
-        # Obtenemos la sucursal del payload (por defecto 1 si no viene)
-        store_id = int(payload.get("store_id", 1)) 
         
+        # El Front manda store_id = 1
+        store_id_front = int(payload.get("store_id", 1)) 
+        
+        # MAPEADOR: Traducimos el ID 1 al código 101 que usa medicaments_stock
+        # Si tienes más sucursales, podrías usar un diccionario o buscarlo en una tabla 'stores'
+        mapeo_sucursales = {1: 101, 2: 102} 
+        store_para_stock = mapeo_sucursales.get(store_id_front, 101)
+
         if not items:
             raise HTTPException(status_code=400, detail="Carrito vacío")
 
-        # 1. Buscar tarjeta de lealtad
-        card_id = None
-        card_number = payload.get("card_number")
-        if card_number:
-            card_res = supabase.table("loyalty_cards").select("id").eq("card", card_number).execute()
-            if card_res.data:
-                card_id = card_res.data[0]["id"]
+        # --- 1. VALIDACIÓN PREVIA DE STOCK ---
+        for item in items:
+            barcode = int(item["barcode"])
+            qty_solicitada = int(item["quantity"])
+            
+            # Buscamos en 'medicaments_stock' usando 'store=101'
+            stock_res = supabase.table("medicaments_stock") \
+                .select("stock, medicaments(name)") \
+                .eq("barcode", barcode) \
+                .eq("store", store_para_stock).execute()
 
-        # 2. Insertar Ticket (Cabecera inicial)
+            if not stock_res.data:
+                raise HTTPException(
+                    status_code=404, 
+                    detail=f"Producto {barcode} no registrado en sucursal {store_para_stock}"
+                )
+            
+            stock_actual = stock_res.data[0]["stock"]
+            nombre_prod = stock_res.data[0].get("medicaments", {}).get("name", "Producto")
+
+            if stock_actual < qty_solicitada:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Stock insuficiente para {nombre_prod}. Disponible: {stock_actual}"
+                )
+
+        # --- 2. INSERTAR TICKET (CABECERA) ---
+        card_number = payload.get("card_number")
+        card_id = None
+        if card_number:
+            c_res = supabase.table("loyalty_cards").select("id").eq("card", card_number).execute()
+            if c_res.data: card_id = c_res.data[0]["id"]
+
         ticket_data = {
             "total": float(payload["total"]),
             "card_id": card_id,
             "card": int(card_number) if card_number else None,
             "payment_method": payload.get("payment_method", "Efectivo"),
-            "store_id": store_id,
+            "store_id": store_id_front, # Aquí guardamos el '1'
             "folio": 0
         }
         
         ticket_res = supabase.table("tickets").insert(ticket_data).execute()
-        if not ticket_res.data:
-            raise Exception("Error al crear la cabecera del ticket")
-            
         nuevo_ticket_id = ticket_res.data[0]["id"]
 
-        # 3. Generar Folio Numérico (BigInt)
-        # Formato: AAAAMMDD + ID_TIENDA (2 dígitos) + ID_TICKET (4 o más dígitos)
+        # Generar Folio
         fecha_str = datetime.datetime.now().strftime("%Y%m%d")
-        # Generamos un número único que quepa en un BigInt
-        folio_numerico = int(f"{fecha_str}{store_id:02d}{nuevo_ticket_id}")
-        
-        # Actualizamos el ticket con su folio real
+        folio_numerico = int(f"{fecha_str}{store_para_stock}{nuevo_ticket_id}")
         supabase.table("tickets").update({"folio": folio_numerico}).eq("id", nuevo_ticket_id).execute()
 
-        # 4. Detalles y Actualización de Stock
+        # --- 3. DETALLES Y ACTUALIZACIÓN REAL DE STOCK ---
         for item in items:
-            # A. Detalle del ticket
-            detalle = {
+            b_code = int(item["barcode"])
+            qty = int(item["quantity"])
+
+            # A. Guardar detalle del ticket
+            supabase.table("ticket_details").insert({
                 "ticket_id": nuevo_ticket_id,
-                "barcode": int(item["barcode"]),
-                "quantity": int(item["quantity"]),
-                "price_at_sale": float(item["price"]),
-                "promotion_id": item.get("promotion_id") if item.get("promotion_id") else None
-            }
-            supabase.table("ticket_details").insert(detalle).execute()
+                "barcode": b_code,
+                "quantity": qty,
+                "price_at_sale": float(item["price"])
+            }).execute()
 
-            # B. Actualizar Stock en la sucursal específica
-            stock_res = supabase.table("medicaments_stock") \
+            # B. Restar Stock usando el ID 101
+            # Primero obtenemos el valor más fresco
+            curr = supabase.table("medicaments_stock") \
                 .select("stock") \
-                .eq("barcode", item["barcode"]) \
-                .eq("store", store_id).execute()
+                .eq("barcode", b_code) \
+                .eq("store", store_para_stock).execute()
+            
+            nuevo_stock = curr.data[0]["stock"] - qty
 
-            if stock_res.data:
-                actual_stock = stock_res.data[0]["stock"]
-                nuevo_stock = actual_stock - int(item["quantity"])
-                
-                supabase.table("medicaments_stock") \
-                    .update({"stock": nuevo_stock}) \
-                    .eq("barcode", item["barcode"]) \
-                    .eq("store", store_id).execute()
+            # Actualizamos la tabla medicaments_stock
+            supabase.table("medicaments_stock") \
+                .update({"stock": nuevo_stock}) \
+                .eq("barcode", b_code) \
+                .eq("store", store_para_stock).execute()
 
         return {
             "status": "success", 
-            "ticket_id": nuevo_ticket_id, 
             "folio": folio_numerico,
-            "store_id": store_id
+            "ticket_id": nuevo_ticket_id
         }
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print(f"Error detallado en Venta: {str(e)}")
+        print(f"Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     
 ## TARJETAS DE LEALTAD
