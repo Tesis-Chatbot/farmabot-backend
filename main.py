@@ -3,6 +3,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from database import supabase
+import datetime
+import re
 
 load_dotenv()
 
@@ -17,8 +19,8 @@ tags_metadata = [
         "description": "Operaciones relacionadas con el procesamiento de tickets y actualización de inventario.",
     },
     {
-        "name": "Sistema",
-        "description": "Validación de estado del servidor.",
+        "name": "Tarjetas de Lealtad",
+        "description": "Consulta de historial de clientes y beneficios por puntos.",
     },
 ]
 
@@ -46,6 +48,7 @@ app.add_middleware(
 def read_root():
     return {"message": "Conexión exitosa, bienvenido a FarmaBot"}
 
+## CATALOGO DE PRODUCTOS
 @app.get("/medicamentos", tags=["Catalogo de Productos"])
 def get_medicamentos():
     # Consultamos medicamentos con su stock y sus promociones activas
@@ -100,65 +103,179 @@ def get_medicamentos():
         
     return productos_finales
 
+
+
+## PUNTO DE VENTA
 @app.post("/ventas", tags=["Punto de Venta"])
 async def procesar_venta(payload: dict = Body(...)):
     try:
         items = payload.get("items", [])
+        # Obtenemos la sucursal del payload (por defecto 1 si no viene)
+        store_id = int(payload.get("store_id", 1)) 
+        
         if not items:
             raise HTTPException(status_code=400, detail="Carrito vacío")
 
-        # 1. Buscar tarjeta de lealtad para obtener el ID numérico
+        # 1. Buscar tarjeta de lealtad
         card_id = None
-        if payload.get("card_number"):
-            # Buscamos en loyalty_cards usando el número de 14 dígitos
-            card_res = supabase.table("loyalty_cards").select("id").eq("card", payload["card_number"]).execute()
+        card_number = payload.get("card_number")
+        if card_number:
+            card_res = supabase.table("loyalty_cards").select("id").eq("card", card_number).execute()
             if card_res.data:
                 card_id = card_res.data[0]["id"]
 
-        # 2. Insertar Ticket (Cabecera)
-        # Nota: 'folio' e 'id' son automáticos si están configurados como serial/identity
+        # 2. Insertar Ticket (Cabecera inicial)
         ticket_data = {
             "total": float(payload["total"]),
-            "card_id": card_id, # El ID (FK)
-            "card": int(payload["card_number"]) if payload.get("card_number") else None, # El número de 14 dígitos como int
-            "payment_method": "Efectivo" # Esto ya debería entrar como string
+            "card_id": card_id,
+            "card": int(card_number) if card_number else None,
+            "payment_method": payload.get("payment_method", "Efectivo"),
+            "store_id": store_id,
+            "folio": 0
         }
         
         ticket_res = supabase.table("tickets").insert(ticket_data).execute()
-        
         if not ticket_res.data:
-            raise Exception("No se pudo insertar el ticket")
+            raise Exception("Error al crear la cabecera del ticket")
             
         nuevo_ticket_id = ticket_res.data[0]["id"]
 
-        # 3. Detalles y Actualización de Stock
+        # 3. Generar Folio Numérico (BigInt)
+        # Formato: AAAAMMDD + ID_TIENDA (2 dígitos) + ID_TICKET (4 o más dígitos)
+        fecha_str = datetime.datetime.now().strftime("%Y%m%d")
+        # Generamos un número único que quepa en un BigInt
+        folio_numerico = int(f"{fecha_str}{store_id:02d}{nuevo_ticket_id}")
+        
+        # Actualizamos el ticket con su folio real
+        supabase.table("tickets").update({"folio": folio_numerico}).eq("id", nuevo_ticket_id).execute()
+
+        # 4. Detalles y Actualización de Stock
         for item in items:
-            # A. Insertar detalle
+            # A. Detalle del ticket
             detalle = {
                 "ticket_id": nuevo_ticket_id,
-                "barcode": int(item["barcode"]), # Convertimos a int para tu FK
+                "barcode": int(item["barcode"]),
                 "quantity": int(item["quantity"]),
-                "price_at_sale": float(item["price"])
+                "price_at_sale": float(item["price"]),
+                "promotion_id": item.get("promotion_id") if item.get("promotion_id") else None
             }
             supabase.table("ticket_details").insert(detalle).execute()
 
-            # B. Actualizar Stock
-            # Buscamos el stock actual en la sucursal 1 (simulada)
+            # B. Actualizar Stock en la sucursal específica
             stock_res = supabase.table("medicaments_stock") \
                 .select("stock") \
                 .eq("barcode", item["barcode"]) \
-                .eq("store", 1).execute()
+                .eq("store", store_id).execute()
 
             if stock_res.data:
-                nuevo_stock = stock_res.data[0]["stock"] - item["quantity"]
+                actual_stock = stock_res.data[0]["stock"]
+                nuevo_stock = actual_stock - int(item["quantity"])
+                
                 supabase.table("medicaments_stock") \
                     .update({"stock": nuevo_stock}) \
                     .eq("barcode", item["barcode"]) \
-                    .eq("store", 1).execute()
+                    .eq("store", store_id).execute()
 
-        return {"status": "success", "ticket_id": nuevo_ticket_id}
+        return {
+            "status": "success", 
+            "ticket_id": nuevo_ticket_id, 
+            "folio": folio_numerico,
+            "store_id": store_id
+        }
 
     except Exception as e:
-        print(f"Error detallado: {str(e)}")
-        # Devolvemos el error para que lo veas en el alert de React
+        print(f"Error detallado en Venta: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+## TARJETAS DE LEALTAD
+@app.get("/clientes/{num_tarjeta}", tags=["Tarjetas de Lealtad"])
+async def get_cliente_by_card(num_tarjeta: int):
+    try:
+        query = """
+            *,
+            tickets!tickets_card_id_fkey (
+                id,
+                ticket_details (
+                    barcode,
+                    quantity,
+                    promotion_id,
+                    medicaments (
+                        name,
+                        promotion (
+                            id,
+                            barcode,
+                            promotion_type,
+                            amount,
+                            active
+                        )
+                    )
+                )
+            )
+        """
+        
+        response = supabase.table("loyalty_cards").select(query).eq("card", num_tarjeta).execute()
+
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Tarjeta no encontrada")
+
+        cliente = response.data[0]
+        tickets = cliente.get("tickets", [])
+        resumen_promociones = {}
+
+        for t in tickets:
+            for detalle in t.get("ticket_details", []):
+                medicamento = detalle.get("medicaments")
+                if not medicamento: continue
+                
+                promos = medicamento.get("promotion", [])
+                promo_activa = next((p for p in promos if p.get("promotion_type") == 2 and p.get("active")), None)
+
+                if promo_activa:
+                    barcode = detalle["barcode"]
+                    raw_amount = str(promo_activa["amount"]) # Trae "3+1"
+                    
+                    # --- Lógica para extraer el número de la meta ---
+                    # Buscamos el primer número antes del '+' o simplemente el número
+                    match = re.search(r'(\d+)', raw_amount)
+                    if match:
+                        meta = int(match.group(1)) # Convierte el "3" de "3+1" a entero
+                    else:
+                        continue # Si no hay números, saltamos esta promo
+                    # -----------------------------------------------
+
+                    cantidad_comprada = detalle["quantity"]
+
+                    if barcode not in resumen_promociones:
+                        resumen_promociones[barcode] = {
+                            "nombre": medicamento["name"],
+                            "acumulado_total": 0,
+                            "meta_para_regalo": meta,
+                            "texto_promo": raw_amount, # Guardamos el "3+1" para el Front
+                            "regalos_ganados": 0,
+                            "unidades_faltantes": 0
+                        }
+                    
+                    resumen_promociones[barcode]["acumulado_total"] += cantidad_comprada
+
+        # Calcular saldos finales
+        for barcode, info in resumen_promociones.items():
+            total = info["acumulado_total"]
+            meta = info["meta_para_regalo"]
+            
+            # Ejemplo: Total 5, Meta 3 (3+1)
+            info["regalos_ganados"] = total // meta # Resultado: 1 regalo
+            resto = total % meta
+            
+            if resto == 0 and total > 0:
+                # Si compró justo 3, 6, 9... le faltan de nuevo 3 para el siguiente ciclo
+                info["unidades_faltantes"] = meta
+            else:
+                info["unidades_faltantes"] = meta - resto
+
+        cliente["resumen_lealtad"] = list(resumen_promociones.values())
+        
+        return cliente
+
+    except Exception as e:
+        print(f"DEBUG ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error procesando la promo 3+1: {str(e)}")
