@@ -191,13 +191,20 @@ async def procesar_venta(payload: dict = Body(...)):
 @app.get("/clientes/{num_tarjeta}", tags=["Tarjetas de Lealtad"])
 async def get_cliente_by_card(num_tarjeta: int):
     try:
+        # Enriquecemos la query con los campos de la cabecera del ticket
         query = """
             *,
             tickets!tickets_card_id_fkey (
                 id,
+                folio,
+                created_at,
+                total,
+                payment_method,
+                store_id,
                 ticket_details (
                     barcode,
                     quantity,
+                    price_at_sale,
                     promotion_id,
                     medicaments (
                         name,
@@ -223,7 +230,14 @@ async def get_cliente_by_card(num_tarjeta: int):
         resumen_promociones = {}
 
         for t in tickets:
+            # Aseguramos que el total sea float/int para evitar errores en el Front
+            t["total"] = float(t.get("total", 0))
+            
             for detalle in t.get("ticket_details", []):
+                # Aseguramos que los precios y cantidades sean numéricos
+                detalle["price_at_sale"] = float(detalle.get("price_at_sale", 0))
+                detalle["quantity"] = int(detalle.get("quantity", 0))
+                
                 medicamento = detalle.get("medicaments")
                 if not medicamento: continue
                 
@@ -232,42 +246,34 @@ async def get_cliente_by_card(num_tarjeta: int):
 
                 if promo_activa:
                     barcode = detalle["barcode"]
-                    raw_amount = str(promo_activa["amount"]) # Trae "3+1"
+                    raw_amount = str(promo_activa["amount"])
                     
-                    # --- Lógica para extraer el número de la meta ---
-                    # Buscamos el primer número antes del '+' o simplemente el número
                     match = re.search(r'(\d+)', raw_amount)
                     if match:
-                        meta = int(match.group(1)) # Convierte el "3" de "3+1" a entero
+                        meta = int(match.group(1))
                     else:
-                        continue # Si no hay números, saltamos esta promo
-                    # -----------------------------------------------
-
-                    cantidad_comprada = detalle["quantity"]
+                        continue
 
                     if barcode not in resumen_promociones:
                         resumen_promociones[barcode] = {
                             "nombre": medicamento["name"],
                             "acumulado_total": 0,
                             "meta_para_regalo": meta,
-                            "texto_promo": raw_amount, # Guardamos el "3+1" para el Front
+                            "texto_promo": raw_amount,
                             "regalos_ganados": 0,
                             "unidades_faltantes": 0
                         }
                     
-                    resumen_promociones[barcode]["acumulado_total"] += cantidad_comprada
+                    resumen_promociones[barcode]["acumulado_total"] += detalle["quantity"]
 
-        # Calcular saldos finales
+        # Calcular saldos finales de lealtad
         for barcode, info in resumen_promociones.items():
             total = info["acumulado_total"]
             meta = info["meta_para_regalo"]
-            
-            # Ejemplo: Total 5, Meta 3 (3+1)
-            info["regalos_ganados"] = total // meta # Resultado: 1 regalo
+            info["regalos_ganados"] = total // meta
             resto = total % meta
             
             if resto == 0 and total > 0:
-                # Si compró justo 3, 6, 9... le faltan de nuevo 3 para el siguiente ciclo
                 info["unidades_faltantes"] = meta
             else:
                 info["unidades_faltantes"] = meta - resto
@@ -278,4 +284,4 @@ async def get_cliente_by_card(num_tarjeta: int):
 
     except Exception as e:
         print(f"DEBUG ERROR: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error procesando la promo 3+1: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error al procesar cliente: {str(e)}")
