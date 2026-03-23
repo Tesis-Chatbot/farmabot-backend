@@ -1,9 +1,10 @@
 import os
+import traceback
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from database import supabase
-import datetime
+from datetime import datetime
 import re
 
 load_dotenv()
@@ -103,6 +104,48 @@ def get_medicamentos():
         
     return productos_finales
 
+@app.post("/promociones", tags=["Catalogo de Productos"])
+async def gestionar_promocion(payload: dict = Body(...)):
+    try:
+        barcode = int(payload.get("barcode"))
+        promo_type = int(payload.get("promotion_type"))
+        active = bool(payload.get("active", True))
+        
+        # Procesamiento del valor a guardar
+        if promo_type == 1: 
+            # Porcentaje: 5 -> "0.05"
+            raw_amount = float(payload.get("amount", 0))
+            valor_final = str(raw_amount / 100)
+            
+        elif promo_type == 2:
+            # N+M: Guardamos como TEXTO "7+4"
+            n = payload.get("n_value", "1")
+            m = payload.get("m_value", "1")
+            valor_final = f"{n}+{m}"
+            
+        else:
+            # Tipos 3 y 4 (Precios/Montos): Guardamos el número como string
+            valor_final = str(payload.get("amount", 0))
+
+        # --- LÓGICA DE UPSERT ---
+        check = supabase.table("promotion").select("id").eq("barcode", barcode).execute()
+        
+        promo_data = {
+            "barcode": barcode,
+            "promotion_type": promo_type,
+            "amount": valor_final, # Ahora es TEXTO
+            "active": active
+        }
+
+        if check.data:
+            res = supabase.table("promotion").update(promo_data).eq("id", check.data[0]["id"]).execute()
+        else:
+            res = supabase.table("promotion").insert(promo_data).execute()
+
+        return {"status": "success", "data": res.data[0]}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 ## PUNTO DE VENTA
