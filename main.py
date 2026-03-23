@@ -133,7 +133,7 @@ async def gestionar_promocion(payload: dict = Body(...)):
         promo_data = {
             "barcode": barcode,
             "promotion_type": promo_type,
-            "amount": valor_final, # Ahora es TEXTO
+            "amount": valor_final, # Ahora es STRING
             "active": active
         }
 
