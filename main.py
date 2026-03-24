@@ -353,3 +353,67 @@ async def get_cliente_by_card(num_tarjeta: int):
     except Exception as e:
         print(f"DEBUG ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error al procesar cliente: {str(e)}")
+    
+@app.post("/loyalty/vincular-ticket", tags=["Tarjetas de Lealtad"])
+async def vincular_ticket_a_tarjeta(payload: dict = Body(...)):
+    try:
+        folio_buscado = payload.get("folio")
+        store_id = payload.get("store_id")
+        num_tarjeta = payload.get("card")
+
+        if not all([folio_buscado, store_id, num_tarjeta]):
+            raise HTTPException(status_code=400, detail="Faltan datos: folio, store_id o card")
+
+        # 1. Verificar que la tarjeta de lealtad existe
+        card_res = supabase.table("loyalty_cards") \
+            .select("id") \
+            .eq("card", num_tarjeta) \
+            .eq("active", True) \
+            .execute()
+
+        if not card_res.data:
+            raise HTTPException(status_code=404, detail="La tarjeta no existe o está inactiva")
+        
+        id_interno_tarjeta = card_res.data[0]["id"]
+
+        # 2. Buscar el ticket por folio y sucursal
+        ticket_res = supabase.table("tickets") \
+            .select("id", "card_id", "card") \
+            .eq("folio", folio_buscado) \
+            .eq("store_id", store_id) \
+            .execute()
+
+        if not ticket_res.data:
+            raise HTTPException(status_code=404, detail="Ticket no encontrado en esta sucursal")
+
+        ticket_actual = ticket_res.data[0]
+
+        # 3. Validar si el ticket ya tiene una tarjeta asignada
+        # Verificamos card_id porque es la FK principal
+        if ticket_actual.get("card_id") is not None:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"El ticket ya está vinculado a la tarjeta terminación {ticket_actual.get('card')}"
+            )
+
+        # 4. Realizar la vinculación (Update)
+        update_res = supabase.table("tickets") \
+            .update({
+                "card_id": id_interno_tarjeta,
+                "card": num_tarjeta
+            }) \
+            .eq("id", ticket_actual["id"]) \
+            .execute()
+
+        return {
+            "status": "success",
+            "message": "Ticket vinculado exitosamente",
+            "ticket_id": ticket_actual["id"],
+            "folio": folio_buscado
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Error en vinculación: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
