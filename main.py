@@ -70,12 +70,12 @@ def get_medicamentos():
     data = response.data if response.data else []
     
     for item in data:
-        # 1. Cálculo de Stock (como ya lo tenías)
+        # 1. Cálculo de Stock
         stock_entries = item.get('medicaments_stock') or []
         total_stock = sum(s.get('stock', 0) for s in stock_entries)
         
         # 2. Filtrado de Promociones Activas
-        # Supabase trae todas, pero solo queremos enviar las que 'active' sea True
+        # Supabase trae todas, pero solo necesitamos recibir las que 'active' sean True
         all_promotions = item.get('promotion') or []
         active_promos = []
         
@@ -92,9 +92,8 @@ def get_medicamentos():
         # 3. Limpieza del objeto para el Front
         nuevo_item = item.copy()
         nuevo_item['stock'] = total_stock
-        nuevo_item['promociones'] = active_promos # Agregamos la lista limpia
+        nuevo_item['promociones'] = active_promos
         
-        # Borramos las relaciones crudas de Supabase para no ensuciar el JSON
         keys_to_del = ['medicaments_stock', 'promotion']
         for key in keys_to_del:
             if key in nuevo_item:
