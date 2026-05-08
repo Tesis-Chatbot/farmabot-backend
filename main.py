@@ -1,7 +1,7 @@
 import os
 import traceback
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body, APIRouter
+from fastapi import FastAPI, HTTPException, Body, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from database import supabase
 from datetime import datetime
@@ -51,57 +51,67 @@ def read_root():
 
 ## CATALOGO DE PRODUCTOS
 @app.get("/medicamentos", tags=["Catalogo de Productos"])
-def get_medicamentos():
-    # Consultamos medicamentos con su stock y sus promociones activas
-    # Traemos: datos de medicina, stock, y de la tabla promotion traemos amount y la descripción del tipo
-    query = """
-        *,
-        medicaments_stock(stock),
-        promotion(
-            id,
-            amount,
-            active,
-            promotion_types(description)
-        )
-    """
-    response = supabase.table("medicaments").select(query).execute()
-    
-    productos_finales = []
-    data = response.data if response.data else []
-    
-    for item in data:
-        # 1. Cálculo de Stock
-        stock_entries = item.get('medicaments_stock') or []
-        total_stock = sum(s.get('stock', 0) for s in stock_entries)
+def get_medicamentos(store_id: int = Query(..., description="ID de la sucursal (ej. 5)")):
+    try:
+        query = """
+            *,
+            medicaments_stock(stock, store_id),
+            promotion(
+                id,
+                amount,
+                active,
+                promotion_types(description)
+            )
+        """
         
-        # 2. Filtrado de Promociones Activas
-        # Supabase trae todas, pero solo necesitamos recibir las que 'active' sean True
-        all_promotions = item.get('promotion') or []
-        active_promos = []
+        # Consultamos a Supabase aplicando el filtro de store_id en la relación de stock
+        response = supabase.table("medicaments") \
+            .select(query) \
+            .eq("medicaments_stock.store_id", store_id) \
+            .execute()
         
-        for p in all_promotions:
-            if p.get('active'):
-                # Simplificamos el objeto de promoción para el Front
-                tipo_desc = p.get('promotion_types', {}).get('description', 'General')
-                active_promos.append({
-                    "id": p.get('id'),
-                    "tipo": tipo_desc,
-                    "valor": p.get('amount')
+        if not response.data:
+            return []
+
+        productos_finales = []
+        
+        for item in response.data:
+            # --- FILTRADO DE STOCK ---
+            stock_list = [s for s in (item.get('medicaments_stock') or []) if s.get('store_id') == store_id]
+
+            if stock_list:
+                total_stock = sum(s.get('stock', 0) for s in stock_list)
+                
+                # --- PROCESAMIENTO DE PROMOCIONES ---
+                raw_promotions = item.get('promotion') or []
+                active_promos = []
+                
+                for p in raw_promotions:
+                    if p.get('active'):
+                        tipo_desc = p.get('promotion_types', {}).get('description', 'General')
+                        active_promos.append({
+                            "id": p.get('id'),
+                            "tipo": tipo_desc,
+                            "valor": p.get('amount')
+                        })
+
+                # --- LIMPIEZA DE OBJETO FINAL ---
+                productos_finales.append({
+                    "id": item.get("id"),
+                    "barcode": item.get("barcode"),
+                    "name": item.get("name"),
+                    "brand": item.get("brand"),
+                    "price": item.get("price"),
+                    "lab": item.get("lab"),
+                    "stock": total_stock,
+                    "promociones": active_promos
                 })
 
-        # 3. Limpieza del objeto para el Front
-        nuevo_item = item.copy()
-        nuevo_item['stock'] = total_stock
-        nuevo_item['promociones'] = active_promos
-        
-        keys_to_del = ['medicaments_stock', 'promotion']
-        for key in keys_to_del:
-            if key in nuevo_item:
-                del nuevo_item[key]
-            
-        productos_finales.append(nuevo_item)
-        
-    return productos_finales
+        return productos_finales
+
+    except Exception as e:
+        print(f"Error detectado: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al sincronizar el inventario con promociones")
 
 @app.post("/promociones", tags=["Catalogo de Productos"])
 async def gestionar_promocion(payload: dict = Body(...)):
@@ -147,19 +157,12 @@ async def gestionar_promocion(payload: dict = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-## PUNTO DE VENTA
+# --- PUNTO DE VENTA ---
 @app.post("/ventas", tags=["Punto de Venta"])
 async def procesar_venta(payload: dict = Body(...)):
     try:
         items = payload.get("items", [])
-        
-        # El Front manda store_id = 1
-        store_id_front = int(payload.get("store_id", 1)) 
-        
-        # MAPEADOR: Traducimos el ID 1 al código 101 que usa medicaments_stock
-        # Si tienes más sucursales, podrías usar un diccionario o buscarlo en una tabla 'stores'
-        mapeo_sucursales = {1: 101, 2: 102} 
-        store_para_stock = mapeo_sucursales.get(store_id_front, 101)
+        store_id = int(payload.get("store_id", 1)) # Usamos store_id directo
 
         if not items:
             raise HTTPException(status_code=400, detail="Carrito vacío")
@@ -169,16 +172,16 @@ async def procesar_venta(payload: dict = Body(...)):
             barcode = int(item["barcode"])
             qty_solicitada = int(item["quantity"])
             
-            # Buscamos en 'medicaments_stock' usando 'store=101'
+            # CORRECCIÓN: Se cambió 'store' por 'store_id'
             stock_res = supabase.table("medicaments_stock") \
                 .select("stock, medicaments(name)") \
                 .eq("barcode", barcode) \
-                .eq("store", store_para_stock).execute()
+                .eq("store_id", store_id).execute()
 
             if not stock_res.data:
                 raise HTTPException(
                     status_code=404, 
-                    detail=f"Producto {barcode} no registrado en sucursal {store_para_stock}"
+                    detail=f"Producto {barcode} no registrado en sucursal {store_id}"
                 )
             
             stock_actual = stock_res.data[0]["stock"]
@@ -190,7 +193,7 @@ async def procesar_venta(payload: dict = Body(...)):
                     detail=f"Stock insuficiente para {nombre_prod}. Disponible: {stock_actual}"
                 )
 
-        # --- 2. INSERTAR TICKET (CABECERA) ---
+        # --- 2. INSERTAR TICKET ---
         card_number = payload.get("card_number")
         card_id = None
         if card_number:
@@ -202,7 +205,7 @@ async def procesar_venta(payload: dict = Body(...)):
             "card_id": card_id,
             "card": int(card_number) if card_number else None,
             "payment_method": payload.get("payment_method", "Efectivo"),
-            "store_id": store_id_front, # Aquí guardamos el '1'
+            "store_id": store_id,
             "folio": 0
         }
         
@@ -210,16 +213,15 @@ async def procesar_venta(payload: dict = Body(...)):
         nuevo_ticket_id = ticket_res.data[0]["id"]
 
         # Generar Folio
-        fecha_str = datetime.datetime.now().strftime("%Y%m%d")
-        folio_numerico = int(f"{fecha_str}{store_para_stock}{nuevo_ticket_id}")
+        fecha_str = datetime.now().strftime("%Y%m%d")   
+        folio_numerico = int(f"{fecha_str}{store_id}{nuevo_ticket_id}")
         supabase.table("tickets").update({"folio": folio_numerico}).eq("id", nuevo_ticket_id).execute()
 
-        # --- 3. DETALLES Y ACTUALIZACIÓN REAL DE STOCK ---
+        # --- 3. ACTUALIZACIÓN DE STOCK ---
         for item in items:
             b_code = int(item["barcode"])
             qty = int(item["quantity"])
 
-            # A. Guardar detalle del ticket
             supabase.table("ticket_details").insert({
                 "ticket_id": nuevo_ticket_id,
                 "barcode": b_code,
@@ -227,20 +229,18 @@ async def procesar_venta(payload: dict = Body(...)):
                 "price_at_sale": float(item["price"])
             }).execute()
 
-            # B. Restar Stock usando el ID 101
-            # Primero obtenemos el valor más fresco
+            # CORRECCIÓN: Se cambió 'store' por 'store_id'
             curr = supabase.table("medicaments_stock") \
                 .select("stock") \
                 .eq("barcode", b_code) \
-                .eq("store", store_para_stock).execute()
+                .eq("store_id", store_id).execute()
             
             nuevo_stock = curr.data[0]["stock"] - qty
 
-            # Actualizamos la tabla medicaments_stock
             supabase.table("medicaments_stock") \
                 .update({"stock": nuevo_stock}) \
                 .eq("barcode", b_code) \
-                .eq("store", store_para_stock).execute()
+                .eq("store_id", store_id).execute()
 
         return {
             "status": "success", 
@@ -374,12 +374,16 @@ async def vincular_ticket_a_tarjeta(payload: dict = Body(...)):
             raise HTTPException(status_code=404, detail="La tarjeta no existe o está inactiva")
         
         id_interno_tarjeta = card_res.data[0]["id"]
+        
 
-        # 2. Buscar el ticket por folio y sucursal
+        # Convertimos a string para asegurar que Supabase haga match exacto
+        folio_str = str(payload.get("folio"))
+        store_id_int = int(payload.get("store_id"))
+
         ticket_res = supabase.table("tickets") \
             .select("id", "card_id", "card") \
-            .eq("folio", folio_buscado) \
-            .eq("store_id", store_id) \
+            .eq("folio", folio_str) \
+            .eq("store_id", store_id_int) \
             .execute()
 
         if not ticket_res.data:
