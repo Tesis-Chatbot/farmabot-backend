@@ -23,6 +23,10 @@ tags_metadata = [
         "name": "Tarjetas de Lealtad",
         "description": "Consulta de historial de clientes y beneficios por puntos.",
     },
+    {
+        "name": "Analiticas",
+        "description": "Monitoreo de rendimiento del bot, uso por sucursal y estadísticas de usuario.",
+    },
 ]
 
 # 2. Crear la instancia de FastAPI
@@ -420,3 +424,85 @@ async def vincular_ticket_a_tarjeta(payload: dict = Body(...)):
     except Exception as e:
         print(f"Error en vinculación: {str(e)}")
         raise HTTPException(status_code=500, detail="Error interno del servidor")
+    
+    
+# --- ANALÍTICAS ---
+
+@app.post("/analytics/log", tags=["Analiticas"])
+async def log_bot_activity(payload: dict = Body(...)):
+    """
+    Registra la actividad del bot: intención, duración de la acción, 
+    sucursal y sesión del usuario.
+    """
+    try:
+        log_data = {
+            "session_id": payload.get("session_id"),
+            "user_id": payload.get("user_id"), # ID del usuario/doctor
+            "intent": payload.get("intent"),
+            "action": payload.get("action"),
+            "store_id": payload.get("store_id"),
+            "duration": float(payload.get("duration", 0)),
+            "created_at": datetime.now().isoformat()
+        }
+        
+        res = supabase.table("bot_analytics").insert(log_data).execute()
+        return {"status": "success", "message": "Actividad registrada"}
+    except Exception as e:
+        print(f"Error en logs: {str(e)}")
+        # No lanzamos HTTPException para no interrumpir el flujo del bot si falla el log
+        return {"status": "error", "detail": str(e)}
+    
+@app.get("/analytics/summary", tags=["Analiticas"])
+async def get_analytics_summary():
+    """
+    Obtiene métricas clave: Usuarios únicos, tiempo promedio y uso total.
+    """
+    try:
+        # 1. Total de interacciones
+        total_res = supabase.table("bot_analytics").select("id", count="exact").execute()
+        total_count = total_res.count
+
+        # 2. Usuarios únicos
+        unique_users_res = supabase.table("bot_analytics").select("user_id").execute()
+        unique_count = len(set([u["user_id"] for u in unique_users_res.data if u["user_id"]]))
+
+        # 3. Tiempo promedio de vinculación de ticket
+        avg_res = supabase.table("bot_analytics") \
+            .select("duration") \
+            .eq("intent", "vincular_ticket") \
+            .execute()
+        
+        avg_time = 0
+        if avg_res.data:
+            durations = [d["duration"] for d in avg_res.data]
+            avg_time = sum(durations) / len(durations)
+
+        return {
+            "total_interactions": total_count,
+            "unique_users": unique_count,
+            "avg_ticket_binding_time": round(avg_time, 2),
+            "status": "active"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/analytics/hourly-usage", tags=["Analiticas"])
+async def get_hourly_usage():
+    """
+    Retorna la distribución de uso por hora para el Heatmap del dashboard.
+    """
+    try:
+        res = supabase.table("bot_analytics").select("created_at").execute()
+        
+        # Inicializar diccionario de 24 horas
+        hourly_data = {i: 0 for i in range(24)}
+        
+        for row in res.data:
+            # Extraer la hora del string ISO
+            dt = datetime.fromisoformat(row["created_at"])
+            hourly_data[dt.hour] += 1
+            
+        # Formatear para gráficos de React (ej. Recharts)
+        return [{"hora": f"{h:02d}:00", "cantidad": c} for h, c in hourly_data.items()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
