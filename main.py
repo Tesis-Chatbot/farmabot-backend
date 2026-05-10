@@ -1,9 +1,10 @@
 import os
+import traceback
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, APIRouter, Query
 from fastapi.middleware.cors import CORSMiddleware
 from database import supabase
-import datetime
+from datetime import datetime
 import re
 
 load_dotenv()
@@ -21,6 +22,10 @@ tags_metadata = [
     {
         "name": "Tarjetas de Lealtad",
         "description": "Consulta de historial de clientes y beneficios por puntos.",
+    },
+    {
+        "name": "Analiticas",
+        "description": "Monitoreo de rendimiento del bot, uso por sucursal y estadísticas de usuario.",
     },
 ]
 
@@ -50,74 +55,118 @@ def read_root():
 
 ## CATALOGO DE PRODUCTOS
 @app.get("/medicamentos", tags=["Catalogo de Productos"])
-def get_medicamentos():
-    # Consultamos medicamentos con su stock y sus promociones activas
-    # Traemos: datos de medicina, stock, y de la tabla promotion traemos amount y la descripción del tipo
-    query = """
-        *,
-        medicaments_stock(stock),
-        promotion(
-            id,
-            amount,
-            active,
-            promotion_types(description)
-        )
-    """
-    response = supabase.table("medicaments").select(query).execute()
-    
-    productos_finales = []
-    data = response.data if response.data else []
-    
-    for item in data:
-        # 1. Cálculo de Stock (como ya lo tenías)
-        stock_entries = item.get('medicaments_stock') or []
-        total_stock = sum(s.get('stock', 0) for s in stock_entries)
+def get_medicamentos(store_id: int = Query(..., description="ID de la sucursal (ej. 5)")):
+    try:
+        query = """
+            *,
+            medicaments_stock(stock, store_id),
+            promotion(
+                id,
+                amount,
+                active,
+                promotion_types(description)
+            )
+        """
         
-        # 2. Filtrado de Promociones Activas
-        # Supabase trae todas, pero solo queremos enviar las que 'active' sea True
-        all_promotions = item.get('promotion') or []
-        active_promos = []
+        # Consultamos a Supabase aplicando el filtro de store_id en la relación de stock
+        response = supabase.table("medicaments") \
+            .select(query) \
+            .eq("medicaments_stock.store_id", store_id) \
+            .execute()
         
-        for p in all_promotions:
-            if p.get('active'):
-                # Simplificamos el objeto de promoción para el Front
-                tipo_desc = p.get('promotion_types', {}).get('description', 'General')
-                active_promos.append({
-                    "id": p.get('id'),
-                    "tipo": tipo_desc,
-                    "valor": p.get('amount')
+        if not response.data:
+            return []
+
+        productos_finales = []
+        
+        for item in response.data:
+            # --- FILTRADO DE STOCK ---
+            stock_list = [s for s in (item.get('medicaments_stock') or []) if s.get('store_id') == store_id]
+
+            if stock_list:
+                total_stock = sum(s.get('stock', 0) for s in stock_list)
+                
+                # --- PROCESAMIENTO DE PROMOCIONES ---
+                raw_promotions = item.get('promotion') or []
+                active_promos = []
+                
+                for p in raw_promotions:
+                    if p.get('active'):
+                        tipo_desc = p.get('promotion_types', {}).get('description', 'General')
+                        active_promos.append({
+                            "id": p.get('id'),
+                            "tipo": tipo_desc,
+                            "valor": p.get('amount')
+                        })
+
+                # --- LIMPIEZA DE OBJETO FINAL ---
+                productos_finales.append({
+                    "id": item.get("id"),
+                    "barcode": item.get("barcode"),
+                    "name": item.get("name"),
+                    "brand": item.get("brand"),
+                    "price": item.get("price"),
+                    "lab": item.get("lab"),
+                    "stock": total_stock,
+                    "promociones": active_promos
                 })
 
-        # 3. Limpieza del objeto para el Front
-        nuevo_item = item.copy()
-        nuevo_item['stock'] = total_stock
-        nuevo_item['promociones'] = active_promos # Agregamos la lista limpia
+        return productos_finales
+
+    except Exception as e:
+        print(f"Error detectado: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error al sincronizar el inventario con promociones")
+
+@app.post("/promociones", tags=["Catalogo de Productos"])
+async def gestionar_promocion(payload: dict = Body(...)):
+    try:
+        barcode = int(payload.get("barcode"))
+        promo_type = int(payload.get("promotion_type"))
+        active = bool(payload.get("active", True))
         
-        # Borramos las relaciones crudas de Supabase para no ensuciar el JSON
-        keys_to_del = ['medicaments_stock', 'promotion']
-        for key in keys_to_del:
-            if key in nuevo_item:
-                del nuevo_item[key]
+        # Procesamiento del valor a guardar
+        if promo_type == 1: 
+            # Porcentaje: 5 -> "0.05"
+            raw_amount = float(payload.get("amount", 0))
+            valor_final = str(raw_amount / 100)
             
-        productos_finales.append(nuevo_item)
+        elif promo_type == 2:
+            # N+M: Guardamos como TEXTO "7+4"
+            n = payload.get("n_value", "1")
+            m = payload.get("m_value", "1")
+            valor_final = f"{n}+{m}"
+            
+        else:
+            # Tipos 3 y 4 (Precios/Montos): Guardamos el número como string
+            valor_final = str(payload.get("amount", 0))
+
+        # --- LÓGICA DE UPSERT ---
+        check = supabase.table("promotion").select("id").eq("barcode", barcode).execute()
         
-    return productos_finales
+        promo_data = {
+            "barcode": barcode,
+            "promotion_type": promo_type,
+            "amount": valor_final, # Ahora es STRING
+            "active": active
+        }
+
+        if check.data:
+            res = supabase.table("promotion").update(promo_data).eq("id", check.data[0]["id"]).execute()
+        else:
+            res = supabase.table("promotion").insert(promo_data).execute()
+
+        return {"status": "success", "data": res.data[0]}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-
-## PUNTO DE VENTA
+# --- PUNTO DE VENTA ---
 @app.post("/ventas", tags=["Punto de Venta"])
 async def procesar_venta(payload: dict = Body(...)):
     try:
         items = payload.get("items", [])
-        
-        # El Front manda store_id = 1
-        store_id_front = int(payload.get("store_id", 1)) 
-        
-        # MAPEADOR: Traducimos el ID 1 al código 101 que usa medicaments_stock
-        # Si tienes más sucursales, podrías usar un diccionario o buscarlo en una tabla 'stores'
-        mapeo_sucursales = {1: 101, 2: 102} 
-        store_para_stock = mapeo_sucursales.get(store_id_front, 101)
+        store_id = int(payload.get("store_id", 1)) # Usamos store_id directo
 
         if not items:
             raise HTTPException(status_code=400, detail="Carrito vacío")
@@ -127,16 +176,16 @@ async def procesar_venta(payload: dict = Body(...)):
             barcode = int(item["barcode"])
             qty_solicitada = int(item["quantity"])
             
-            # Buscamos en 'medicaments_stock' usando 'store=101'
+            # CORRECCIÓN: Se cambió 'store' por 'store_id'
             stock_res = supabase.table("medicaments_stock") \
                 .select("stock, medicaments(name)") \
                 .eq("barcode", barcode) \
-                .eq("store", store_para_stock).execute()
+                .eq("store_id", store_id).execute()
 
             if not stock_res.data:
                 raise HTTPException(
                     status_code=404, 
-                    detail=f"Producto {barcode} no registrado en sucursal {store_para_stock}"
+                    detail=f"Producto {barcode} no registrado en sucursal {store_id}"
                 )
             
             stock_actual = stock_res.data[0]["stock"]
@@ -148,7 +197,7 @@ async def procesar_venta(payload: dict = Body(...)):
                     detail=f"Stock insuficiente para {nombre_prod}. Disponible: {stock_actual}"
                 )
 
-        # --- 2. INSERTAR TICKET (CABECERA) ---
+        # --- 2. INSERTAR TICKET ---
         card_number = payload.get("card_number")
         card_id = None
         if card_number:
@@ -160,7 +209,7 @@ async def procesar_venta(payload: dict = Body(...)):
             "card_id": card_id,
             "card": int(card_number) if card_number else None,
             "payment_method": payload.get("payment_method", "Efectivo"),
-            "store_id": store_id_front, # Aquí guardamos el '1'
+            "store_id": store_id,
             "folio": 0
         }
         
@@ -168,16 +217,15 @@ async def procesar_venta(payload: dict = Body(...)):
         nuevo_ticket_id = ticket_res.data[0]["id"]
 
         # Generar Folio
-        fecha_str = datetime.datetime.now().strftime("%Y%m%d")
-        folio_numerico = int(f"{fecha_str}{store_para_stock}{nuevo_ticket_id}")
+        fecha_str = datetime.now().strftime("%Y%m%d")   
+        folio_numerico = int(f"{fecha_str}{store_id}{nuevo_ticket_id}")
         supabase.table("tickets").update({"folio": folio_numerico}).eq("id", nuevo_ticket_id).execute()
 
-        # --- 3. DETALLES Y ACTUALIZACIÓN REAL DE STOCK ---
+        # --- 3. ACTUALIZACIÓN DE STOCK ---
         for item in items:
             b_code = int(item["barcode"])
             qty = int(item["quantity"])
 
-            # A. Guardar detalle del ticket
             supabase.table("ticket_details").insert({
                 "ticket_id": nuevo_ticket_id,
                 "barcode": b_code,
@@ -185,20 +233,18 @@ async def procesar_venta(payload: dict = Body(...)):
                 "price_at_sale": float(item["price"])
             }).execute()
 
-            # B. Restar Stock usando el ID 101
-            # Primero obtenemos el valor más fresco
+            # CORRECCIÓN: Se cambió 'store' por 'store_id'
             curr = supabase.table("medicaments_stock") \
                 .select("stock") \
                 .eq("barcode", b_code) \
-                .eq("store", store_para_stock).execute()
+                .eq("store_id", store_id).execute()
             
             nuevo_stock = curr.data[0]["stock"] - qty
 
-            # Actualizamos la tabla medicaments_stock
             supabase.table("medicaments_stock") \
                 .update({"stock": nuevo_stock}) \
                 .eq("barcode", b_code) \
-                .eq("store", store_para_stock).execute()
+                .eq("store_id", store_id).execute()
 
         return {
             "status": "success", 
@@ -310,3 +356,153 @@ async def get_cliente_by_card(num_tarjeta: int):
     except Exception as e:
         print(f"DEBUG ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error al procesar cliente: {str(e)}")
+    
+@app.post("/loyalty/vincular-ticket", tags=["Tarjetas de Lealtad"])
+async def vincular_ticket_a_tarjeta(payload: dict = Body(...)):
+    try:
+        folio_buscado = payload.get("folio")
+        store_id = payload.get("store_id")
+        num_tarjeta = payload.get("card")
+
+        if not all([folio_buscado, store_id, num_tarjeta]):
+            raise HTTPException(status_code=400, detail="Faltan datos: folio, store_id o card")
+
+        # 1. Verificar que la tarjeta de lealtad existe
+        card_res = supabase.table("loyalty_cards") \
+            .select("id") \
+            .eq("card", num_tarjeta) \
+            .eq("active", True) \
+            .execute()
+
+        if not card_res.data:
+            raise HTTPException(status_code=404, detail="La tarjeta no existe o está inactiva")
+        
+        id_interno_tarjeta = card_res.data[0]["id"]
+        
+
+        # Convertimos a string para asegurar que Supabase haga match exacto
+        folio_str = str(payload.get("folio"))
+        store_id_int = int(payload.get("store_id"))
+
+        ticket_res = supabase.table("tickets") \
+            .select("id", "card_id", "card") \
+            .eq("folio", folio_str) \
+            .eq("store_id", store_id_int) \
+            .execute()
+
+        if not ticket_res.data:
+            raise HTTPException(status_code=404, detail="Ticket no encontrado en esta sucursal")
+
+        ticket_actual = ticket_res.data[0]
+
+        # 3. Validar si el ticket ya tiene una tarjeta asignada
+        # Verificamos card_id porque es la FK principal
+        if ticket_actual.get("card_id") is not None:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"El ticket ya está vinculado a la tarjeta terminación {ticket_actual.get('card')}"
+            )
+
+        # 4. Realizar la vinculación (Update)
+        update_res = supabase.table("tickets") \
+            .update({
+                "card_id": id_interno_tarjeta,
+                "card": num_tarjeta
+            }) \
+            .eq("id", ticket_actual["id"]) \
+            .execute()
+
+        return {
+            "status": "success",
+            "message": "Ticket vinculado exitosamente",
+            "ticket_id": ticket_actual["id"],
+            "folio": folio_buscado
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Error en vinculación: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
+    
+    
+# --- ANALÍTICAS ---
+
+@app.post("/analytics/log", tags=["Analiticas"])
+async def log_bot_activity(payload: dict = Body(...)):
+    """
+    Registra la actividad del bot: intención, duración de la acción, 
+    sucursal y sesión del usuario.
+    """
+    try:
+        log_data = {
+            "session_id": payload.get("session_id"),
+            "user_id": payload.get("user_id"), # ID del usuario/doctor
+            "intent": payload.get("intent"),
+            "action": payload.get("action"),
+            "store_id": payload.get("store_id"),
+            "duration": float(payload.get("duration", 0)),
+            "created_at": datetime.now().isoformat()
+        }
+        
+        res = supabase.table("bot_analytics").insert(log_data).execute()
+        return {"status": "success", "message": "Actividad registrada"}
+    except Exception as e:
+        print(f"Error en logs: {str(e)}")
+        # No lanzamos HTTPException para no interrumpir el flujo del bot si falla el log
+        return {"status": "error", "detail": str(e)}
+    
+@app.get("/analytics/summary", tags=["Analiticas"])
+async def get_analytics_summary():
+    """
+    Obtiene métricas clave: Usuarios únicos, tiempo promedio y uso total.
+    """
+    try:
+        # 1. Total de interacciones
+        total_res = supabase.table("bot_analytics").select("id", count="exact").execute()
+        total_count = total_res.count
+
+        # 2. Usuarios únicos
+        unique_users_res = supabase.table("bot_analytics").select("user_id").execute()
+        unique_count = len(set([u["user_id"] for u in unique_users_res.data if u["user_id"]]))
+
+        # 3. Tiempo promedio de vinculación de ticket
+        avg_res = supabase.table("bot_analytics") \
+            .select("duration") \
+            .eq("intent", "vincular_ticket") \
+            .execute()
+        
+        avg_time = 0
+        if avg_res.data:
+            durations = [d["duration"] for d in avg_res.data]
+            avg_time = sum(durations) / len(durations)
+
+        return {
+            "total_interactions": total_count,
+            "unique_users": unique_count,
+            "avg_ticket_binding_time": round(avg_time, 2),
+            "status": "active"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/analytics/hourly-usage", tags=["Analiticas"])
+async def get_hourly_usage():
+    """
+    Retorna la distribución de uso por hora para el Heatmap del dashboard.
+    """
+    try:
+        res = supabase.table("bot_analytics").select("created_at").execute()
+        
+        # Inicializar diccionario de 24 horas
+        hourly_data = {i: 0 for i in range(24)}
+        
+        for row in res.data:
+            # Extraer la hora del string ISO
+            dt = datetime.fromisoformat(row["created_at"])
+            hourly_data[dt.hour] += 1
+            
+        # Formatear para gráficos de React (ej. Recharts)
+        return [{"hora": f"{h:02d}:00", "cantidad": c} for h, c in hourly_data.items()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
